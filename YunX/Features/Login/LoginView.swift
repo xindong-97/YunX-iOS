@@ -1,0 +1,283 @@
+//
+//  LoginView.swift
+//  YunX · WKWebView 登录（抓 Cookie / Token）
+//
+//  桌面版用内嵌 Chromium 登录后遍历 Cookie 库；iOS 用 WKWebView + WKHTTPCookieStore，
+//  轮询检测必需键，命中即回调保存。
+//
+
+import SwiftUI
+import WebKit
+
+struct LoginView: View {
+    let platform: SharePlatform
+    var onSuccess: (String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var progress: Double = 0
+    @State private var hint: String = "请在页面内完成登录"
+    @State private var manualCookie: String = ""
+    @State private var showManual = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack(alignment: .top) {
+                CookieWebView(urlString: loginURL,
+                              // 只去前导点。此前 replacingOccurrences(of: ".", with: "")
+                              // 会把 .quark.cn 变成 quarkcn，域匹配永久失效。
+                              cookieDomains: [platform.cookieDomain.hasPrefix(".")
+                                              ? String(platform.cookieDomain.dropFirst())
+                                              : platform.cookieDomain],
+                              requiredKeys: requiredKeys,
+                              onProgress: { progress = $0 },
+                              onFound: { cookie in
+                                  handleCaptured(cookie)
+                              })
+                    .ignoresSafeArea(edges: .bottom)
+
+                if progress < 1 {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .tint(YXColor.brand)
+                }
+            }
+            .navigationTitle("登录 \(platform.displayName)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("手动") { showManual = true }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 8) {
+                    Image(systemName: "info.circle")
+                    Text(hint)
+                    Spacer(minLength: 0)
+                }
+                .font(.yxFootnote)
+                .foregroundStyle(YXColor.secondaryLabel)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+            }
+            .onAppear {
+                // 无明确必需键的平台 WKWebView 不会自动回调 onFound，
+                // 直接引导手动粘贴，别让用户一直等「请在页面内完成登录」。
+                if requiredKeys.isEmpty {
+                    hint = "该平台无法自动检测登录态，请点右上角「手动」粘贴 Cookie / Token"
+                }
+            }
+            .sheet(isPresented: $showManual) {
+                manualSheet
+            }
+        }
+    }
+
+    /// 只有这些平台的凭证能用服务端接口确认（同一个 gettemplatevariable / account info 链路）
+    private var canValidate: Bool {
+        switch platform {
+        case .quark, .uc, .baidu: return true
+        default: return false
+        }
+    }
+
+    /// WKWebView 抓到 Cookie 后先落库，再向服务端确认一次登录态。
+    /// 百度/夸克这类平台的 Cookie 里 HttpOnly 字段可能晚几秒才写入，
+    /// 只靠字符串判断会出现「本地以为登录了、服务端不认」的情况。
+    private func handleCaptured(_ cookie: String) {
+        onSuccess(cookie)
+        guard canValidate else {
+            dismiss()
+            return
+        }
+        hint = "已保存凭证，正在向服务端确认…"
+        Task {
+            let nick = await ResolveService.nickname(platform: platform, cookie: cookie)
+            await MainActor.run {
+                if let nick, !nick.isEmpty {
+                    hint = "登录成功：\(nick)"
+                    dismiss()
+                } else {
+                    hint = "凭证已保存，但服务端未确认。请在页面上确认已显示登录成功并多停留几秒，或返回网盘页重新检测"
+                }
+            }
+        }
+    }
+
+    private var requiredKeys: [String] {
+        switch platform {
+        case .quark, .uc:  return ["__pus", "__puus"]
+        case .baidu:       return ["BDUSS"]
+        case .pan115:      return ["UID", "SEID"]
+        case .lanzou:      return ["phpdisk_info"]
+        default:           return []
+        }
+    }
+
+    private var loginURL: String {
+        switch platform {
+        case .quark:   return "https://pan.quark.cn/?fr=pc&platform=pc"
+        case .uc:      return "https://drive.uc.cn/"
+        case .baidu:   return "https://pan.baidu.com/"
+        case .pan115:  return "https://115.com/"
+        case .lanzou:  return "https://pc.woozooo.com/account.php"
+        case .ilanzou: return "https://www.ilanzou.com/"
+        case .xunlei:  return "https://pan.xunlei.com/"
+        case .c139:    return "https://yun.139.com/"
+        case .guangya: return "https://www.guangyapan.com/"
+        case .pan123:  return "https://www.123pan.com/"
+        case .github:  return "https://github.com/login"
+        }
+    }
+
+    private var manualSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("从任何能登录的浏览器复制完整 Cookie 串粘贴进来")
+                    .font(.yxCaption)
+                    .foregroundStyle(YXColor.secondaryLabel)
+                YXTextField(placeholder: "k1=v1; k2=v2; …",
+                            text: $manualCookie,
+                            symbol: "key",
+                            axis: .vertical,
+                            lineLimit: 4...10)
+                YXPrimaryButton(title: "保存并校验", symbol: "checkmark.seal") {
+                    Task {
+                        if let nick = await ResolveService.nickname(platform: platform, cookie: manualCookie) {
+                            CookieStore.shared.setCookie(manualCookie, for: platform)
+                            await MainActor.run {
+                                hint = "已登录：\(nick)"
+                                showManual = false
+                                onSuccess(manualCookie)
+                                dismiss()
+                            }
+                        } else {
+                            await MainActor.run { hint = "Cookie 无效或已过期" }
+                        }
+                    }
+                }
+                Spacer()
+            }
+            .padding(20)
+            .yxPageBackground()
+            .navigationTitle("手动填写 Cookie")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("关闭") { showManual = false }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+// MARK: - WKWebView 封装
+
+struct CookieWebView: UIViewRepresentable {
+    let urlString: String
+    let cookieDomains: [String]
+    let requiredKeys: [String]
+    let onProgress: (Double) -> Void
+    let onFound: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.allowsBackForwardNavigationGestures = true
+        webView.customUserAgent = YXUA.chromeDesktop
+
+        context.coordinator.startPolling()
+
+        if let url = URL(string: urlString) {
+            webView.load(URLRequest(url: url))
+        }
+        return webView
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        // SwiftUI 重建 CookieWebView 时刷新闭包，否则 Coordinator 永远
+        // 持有首次创建时的 onFound / onProgress。
+        context.coordinator.parent = self
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var parent: CookieWebView
+        private var timer: Timer?
+        private var hasFired = false
+
+        init(_ parent: CookieWebView) {
+            self.parent = parent
+        }
+
+        func startPolling() {
+            timer?.invalidate()
+            timer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in
+                self?.checkCookies()
+            }
+        }
+
+        deinit {
+            timer?.invalidate()
+        }
+
+        private func checkCookies() {
+            // 没有明确必需键的平台不做自动检测，只走手动粘贴
+            guard !parent.requiredKeys.isEmpty, !hasFired else { return }
+            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
+                guard let self else { return }
+                let domains = self.parent.cookieDomains.map { $0.lowercased() }
+                let relevant = cookies.filter { cookie in
+                    let d = cookie.domain.lowercased()
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                    return domains.contains { d == $0 || d.hasSuffix("." + $0) }
+                }
+                // 域匹配为空时不能回退成「拼接全部站点 Cookie」：那会把
+                // 无关域的凭证一起写进网盘请求头。必需键也只在目标域内判定。
+                guard !relevant.isEmpty else { return }
+                let names = Set(relevant.map { $0.name })
+                guard self.parent.requiredKeys.allSatisfy({ names.contains($0) }) else { return }
+                let header = relevant
+                    .map { "\($0.name)=\($0.value)" }
+                    .joined(separator: "; ")
+                guard !header.isEmpty else { return }
+
+                // Timer 装在主线程 RunLoop，只能在主线程 invalidate；
+                // getAllCookies 回调不在主线程，且 didFinish 与 1.2s 轮询
+                // 会并发触发，hasFired 保证 onFound 只走一次。
+                DispatchQueue.main.async {
+                    guard !self.hasFired else { return }
+                    self.hasFired = true
+                    self.timer?.invalidate()
+                    self.timer = nil
+                    self.parent.onFound(header)
+                }
+            }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            parent.onProgress(1)
+            checkCookies()
+        }
+
+        func webView(_ webView: WKWebView,
+                     didStartProvisionalNavigation navigation: WKNavigation!) {
+            parent.onProgress(0.3)
+        }
+
+        func webView(_ webView: WKWebView,
+                     didFailProvisionalNavigation navigation: WKNavigation!,
+                     withError error: Error) {
+            parent.onProgress(1)
+        }
+    }
+}
