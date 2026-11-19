@@ -283,8 +283,76 @@ final class XunleiProvider: PanProvider {
     }
 
     func nickname(cookie: String) async -> String? {
-        // 迅雷昵称只出现在登录链路（v3/login / smslogin），游客态无从获取
-        return nil
+        guard let account = XunleiAccount.load(), !account.nickname.isEmpty else { return nil }
+        return account.nickname
+    }
+
+    private var effectiveDeviceId: String {
+        if !bearerToken.isEmpty,
+           let account = XunleiAccount.load(), !account.deviceId.isEmpty {
+            return account.deviceId
+        }
+        return XLDevice.deviceId
+    }
+
+    func verifyAndSaveWebTokens(_ raw: String) async -> String? {
+        guard let tokens = XunleiWebCredential.parse(raw), !tokens.accessToken.isEmpty else { return nil }
+        let deviceId = tokens.deviceId.isEmpty ? XLDevice.deviceId : tokens.deviceId
+        let userId = tokens.userId.isEmpty ? XunleiAccount.jwtSub(tokens.accessToken) : tokens.userId
+        let nickname = tokens.nickname.isEmpty ? "迅雷用户" : tokens.nickname
+        let previousAccount = XunleiAccount.load()
+        let previousAccess = PanTool.cookie(.xunlei)
+        bearerToken = tokens.accessToken
+        invalidateCaptcha()
+        PanTool.setCookie(tokens.accessToken, .xunlei)
+        XunleiAccount.save(XunleiStoredAccount(
+            refreshToken: tokens.refreshToken,
+            deviceId: deviceId,
+            captchaToken: tokens.captchaToken,
+            userId: userId,
+            nickname: nickname,
+            authType: XunleiWebCredential.authType))
+        do {
+            let response = try await panJSON(url: XC.panBase + "/drive/v1/about",
+                                             action: "GET:/drive/v1/about")
+            let hasData = response["data"] as? [String: Any] != nil
+            guard hasData || response.yxString("kind") == "drive#about" else {
+                restoreAccount(previousAccount, accessToken: previousAccess)
+                return nil
+            }
+            return nickname
+        } catch {
+            restoreAccount(previousAccount, accessToken: previousAccess)
+            return nil
+        }
+    }
+
+    private func restoreAccount(_ account: XunleiStoredAccount?, accessToken: String) {
+        bearerToken = ""
+        if let account, !accessToken.isEmpty {
+            PanTool.setCookie(accessToken, .xunlei)
+            XunleiAccount.save(account)
+            bearerToken = accessToken
+        } else {
+            XunleiAccount.clear()
+        }
+    }
+
+    private var didRefreshToken = false
+
+    private func refreshAccessTokenIfPossible() async -> Bool {
+        guard !didRefreshToken else { return false }
+        didRefreshToken = true
+        guard let account = XunleiAccount.load(), !account.refreshToken.isEmpty else { return false }
+        guard let pair = await XunleiAccount.refreshTokens(refreshToken: account.refreshToken,
+                                                           deviceId: account.deviceId) else { return false }
+        bearerToken = pair.access
+        PanTool.setCookie(pair.access, .xunlei)
+        var updated = account
+        if !pair.refresh.isEmpty { updated.refreshToken = pair.refresh }
+        XunleiAccount.save(updated)
+        invalidateCaptcha()
+        return true
     }
 
     // MARK: - pan 请求
@@ -320,6 +388,9 @@ final class XunleiProvider: PanProvider {
 
                 lastMessage = Self.errorMessage(response)
                 if error == "unauthenticated" || error == "captcha_invalid" {
+                    if error == "unauthenticated", await refreshAccessTokenIfPossible() {
+                        continue
+                    }
                     // 游客链路：token 与 captcha 双双作废，下一轮重新现签（或直接匿名）
                     bearerToken = ""
                     invalidateCaptcha()
@@ -331,6 +402,9 @@ final class XunleiProvider: PanProvider {
                 lastMessage = hint.isEmpty ? "HTTP \(code)" : "HTTP \(code)：\(hint)"
                 if code == 401 || code == 403
                     || (code == 400 && hint.lowercased().contains("captcha")) {
+                    if (code == 401 || code == 403), await refreshAccessTokenIfPossible() {
+                        continue
+                    }
                     bearerToken = ""
                     invalidateCaptcha()
                     continue
@@ -348,7 +422,7 @@ final class XunleiProvider: PanProvider {
     private func panHeaders(captcha: String) -> [String: String] {
         var headers: [String: String] = [
             "User-Agent": XC.webUa,
-            "X-Device-Id": XLDevice.deviceId,
+            "X-Device-Id": effectiveDeviceId,
             "X-Client-Version": XC.clientVersion,
             "Content-Type": "application/json",
             "Origin": "https://pan.xunlei.com",
@@ -378,7 +452,8 @@ final class XunleiProvider: PanProvider {
         if bearerToken.isEmpty {
             result = await initCaptchaApp(action: action)
         } else {
-            result = await initCaptchaWeb(action: action)
+            let userId = XunleiAccount.load()?.userId ?? XunleiAccount.jwtSub(bearerToken)
+            result = await initCaptchaWeb(action: action, userId: userId)
         }
 
         guard !result.token.isEmpty else {
@@ -405,13 +480,13 @@ final class XunleiProvider: PanProvider {
             "client_version": XC.clientVersion,
             "package_name": XC.packageName,
             "timestamp": timestamp,
-            "captcha_sign": XC.appCaptchaSign(deviceId: XLDevice.deviceId, timestamp: timestamp),
+            "captcha_sign": XC.appCaptchaSign(deviceId: effectiveDeviceId, timestamp: timestamp),
             "user_id": ""
         ]
         let payload: [String: Any] = [
             "client_id": XC.appClientId,
             "action": action,
-            "device_id": XLDevice.deviceId,
+            "device_id": effectiveDeviceId,
             "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
             "meta": meta,
             "captcha_token": captchaToken
@@ -421,7 +496,7 @@ final class XunleiProvider: PanProvider {
             "Accept": "application/json;charset=UTF-8",
             "Content-Type": "application/json",
             "X-Client-Id": XC.appClientId,
-            "X-Device-Id": XLDevice.deviceId,
+            "X-Device-Id": effectiveDeviceId,
             "X-Client-Version": XC.clientVersion
         ]
         return await requestCaptchaToken(payload: payload,
@@ -431,7 +506,7 @@ final class XunleiProvider: PanProvider {
 
     /// 网页通道 captcha init（XunleiApi.initWebCaptcha）：9 盐签名 + 桌面 UA + Origin/Referer。
     /// 用 App 签名去换网页 token 会被判 `client_id not match`，两套盐绝不能串。
-    private func initCaptchaWeb(action: String) async -> (token: String, ttl: TimeInterval) {
+    private func initCaptchaWeb(action: String, userId: String = "") async -> (token: String, ttl: TimeInterval) {
         let timestamp = Self.timestampMs()
         let meta: [String: Any] = [
             "username": "",
@@ -439,14 +514,14 @@ final class XunleiProvider: PanProvider {
             "email": "",
             "package_name": XC.webPackageName,
             "client_version": XC.webClientVersion,
-            "captcha_sign": XC.webCaptchaSign(deviceId: XLDevice.deviceId, timestamp: timestamp),
+            "captcha_sign": XC.webCaptchaSign(deviceId: effectiveDeviceId, timestamp: timestamp),
             "timestamp": timestamp,
-            "user_id": ""
+            "user_id": userId
         ]
         let payload: [String: Any] = [
             "client_id": XC.webClientId,
             "action": action,
-            "device_id": XLDevice.deviceId,
+            "device_id": effectiveDeviceId,
             "meta": meta
         ]
         let headers: [String: String] = [
