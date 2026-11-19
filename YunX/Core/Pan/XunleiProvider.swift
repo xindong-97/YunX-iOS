@@ -313,7 +313,7 @@ final class XunleiProvider: PanProvider {
                                                       headers: panHeaders(captcha: captcha),
                                                       body: body,
                                                       injectCookies: false,
-                                                      allowStatus: [200, 201, 204])
+                                                      allowStatus: [200, 201, 204, 400])
 
                 let error = response.yxString("error") ?? ""
                 if error.isEmpty { return response }
@@ -329,7 +329,8 @@ final class XunleiProvider: PanProvider {
             } catch YXError.badStatus(let code, let text) {
                 let hint = text ?? ""
                 lastMessage = hint.isEmpty ? "HTTP \(code)" : "HTTP \(code)：\(hint)"
-                if code == 401 || code == 403 {
+                if code == 401 || code == 403
+                    || (code == 400 && hint.lowercased().contains("captcha")) {
                     bearerToken = ""
                     invalidateCaptcha()
                     continue
@@ -561,10 +562,17 @@ final class XunleiProvider: PanProvider {
             response.yxString("message"),
             response.yxString("error")
         ]
+        var base = "迅雷接口返回错误"
         for candidate in candidates {
-            if let text = candidate, !text.isEmpty { return text }
+            if let text = candidate, !text.isEmpty { base = text; break }
         }
-        return "迅雷接口返回错误"
+        for entry in response.yxArray("error_details") {
+            if let detail = entry["detail"] as? String,
+               !detail.isEmpty, detail != base {
+                return base + "（" + detail + "）"
+            }
+        }
+        return base
     }
 
     private static func friendlyMessage(code: Int, raw: String) -> String {
