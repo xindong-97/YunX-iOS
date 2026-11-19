@@ -270,6 +270,52 @@ final class ChunkWriter {
     }
 }
 
+final class InflightChunk {
+    let size: Int64
+    var bytes: Int64 = 0
+    var startedAt = Date()
+    var lastBytes: Int64 = 0
+    var lastAt = Date()
+    var lastBps: Int64 = 0
+    var preemptCount: Int = 0
+    var lastPreemptAt = Date(timeIntervalSince1970: 0)
+    var preempt = false
+    weak var transfer: StreamTransfer?
+
+    init(size: Int64) {
+        self.size = size
+    }
+}
+
+final class InflightRegistry {
+    private let lock = NSLock()
+    private var chunks: [Int: InflightChunk] = [:]
+
+    func register(_ chunk: InflightChunk, for index: Int) {
+        lock.lock()
+        chunks[index] = chunk
+        lock.unlock()
+    }
+
+    func unregister(for index: Int) {
+        lock.lock()
+        chunks.removeValue(forKey: index)
+        lock.unlock()
+    }
+
+    func updateBytes(_ bytes: Int64, for index: Int) {
+        lock.lock()
+        chunks[index]?.bytes = bytes
+        lock.unlock()
+    }
+
+    func perform<T>(_ body: ([Int: InflightChunk]) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(chunks)
+    }
+}
+
 // MARK: - 流式传输协调器
 
 final class StreamTransfer: NSObject, URLSessionDataDelegate {
@@ -745,6 +791,20 @@ final class DownloadEngine {
         let reporter = ProgressReporter(initial: manifest.doneBytes, total: total, onUpdate: progress)
         progress(manifest.doneBytes, total)
 
+        let registry = InflightRegistry()
+        let runStart = Date()
+        let initialDone = manifest.doneBytes
+        let watchdog = Task { [self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                if Task.isCancelled { break }
+                let downloaded = box.snapshot().doneBytes - initialDone
+                let elapsedMs = Int64(Date().timeIntervalSince(runStart) * 1000)
+                preemptSlowChunks(registry: registry, downloaded: downloaded, elapsedMs: elapsedMs, workers: workers)
+            }
+        }
+        defer { watchdog.cancel() }
+
         // 分片索引队列（按字节顺序发，物理相邻利于连接复用）
         var pending = manifest.chunks.indices.filter { !manifest.chunks[$0].isFinished }
 
@@ -767,6 +827,7 @@ final class DownloadEngine {
                                            sessionKey: sessionKey,
                                            etag: probe.etag,
                                            reporter: reporter,
+                                           registry: registry,
                                            isCancelled: isCancelled)
                     }
                 }
@@ -835,6 +896,64 @@ final class DownloadEngine {
 
     // MARK: 单片
 
+    private func consumePreempt(registry: InflightRegistry,
+                                index: Int,
+                                box: ManifestBox,
+                                manifestURL: URL,
+                                isCancelled: @escaping @Sendable () -> Bool) -> Bool {
+        if isCancelled() { return false }
+        let got: Int64? = registry.perform { states in
+            guard let s = states[index], s.preempt else { return nil }
+            s.preempt = false
+            return s.bytes
+        }
+        guard let got else { return false }
+        let delta = got - box.chunk(at: index).done
+        if delta > 0 {
+            let snapshot = box.addDone(index: index, bytes: delta)
+            try? persist(snapshot, to: manifestURL)
+        }
+        return true
+    }
+
+    private func preemptSlowChunks(registry: InflightRegistry, downloaded: Int64, elapsedMs: Int64, workers: Int) {
+        let now = Date()
+        let toCancel: [StreamTransfer] = registry.perform { states in
+            if states.isEmpty { return [] }
+            for (_, s) in states {
+                let delta = s.bytes - s.lastBytes
+                let dt = max(now.timeIntervalSince(s.lastAt), 0.001)
+                s.lastBps = Int64(Double(max(delta, 0)) / dt)
+                s.lastBytes = s.bytes
+                s.lastAt = now
+            }
+            let avgPerConn: Int64 = (elapsedMs > 0 && workers > 0) ? downloaded * 1000 / elapsedMs / Int64(workers) : 0
+            let floor = max(Int64(12 * 1024), avgPerConn / 2)
+            var taken = 0
+            var cancel: [StreamTransfer] = []
+            for (_, s) in states.sorted(by: { $0.value.lastBps < $1.value.lastBps }) {
+                if taken >= 2 { break }
+                if s.preemptCount >= 3 { continue }
+                if now.timeIntervalSince(s.lastPreemptAt) < 10 { continue }
+                let age = now.timeIntervalSince(s.startedAt)
+                if states.count <= 3 {
+                    if age < 3 { continue }
+                } else {
+                    if age < 15 { continue }
+                    if s.size - s.bytes < 128 * 1024 { continue }
+                }
+                if s.lastBps >= floor { continue }
+                s.preemptCount += 1
+                s.lastPreemptAt = now
+                s.preempt = true
+                if let t = s.transfer { cancel.append(t) }
+                taken += 1
+            }
+            return cancel
+        }
+        toCancel.forEach { $0.cancelAll() }
+    }
+
     private func runChunk(index: Int,
                           spec: DownloadSpec,
                           box: ManifestBox,
@@ -843,7 +962,12 @@ final class DownloadEngine {
                           sessionKey: String,
                           etag: String?,
                           reporter: ProgressReporter,
+                          registry: InflightRegistry,
                           isCancelled: @escaping @Sendable () -> Bool) async throws {
+        let firstPlan = box.chunk(at: index)
+        let state = InflightChunk(size: firstPlan.end - firstPlan.start + 1)
+        registry.register(state, for: index)
+        defer { registry.unregister(for: index) }
         var attempt = 0
         while true {
             if isCancelled() { throw YXError.cancelled }
@@ -871,6 +995,7 @@ final class DownloadEngine {
                 var offset = from
                 let transfer = StreamTransfer(limiter: limiter)
                 registerTransfer(transfer, for: sessionKey)
+                registry.perform { states in states[index]?.transfer = transfer }
                 defer { unregisterTransfer(transfer, for: sessionKey) }
                 let writeError = WriteErrorBox()
                 let progressDelta = ProgressDelta()
@@ -884,11 +1009,13 @@ final class DownloadEngine {
                     }
                     offset += Int64(data.count)
                 } onProgress: { cumulative in
+                    registry.updateBytes(plan.done + cumulative, for: index)
                     // 每收到一段就上报，而不是等整片（约 13MB）跑完才动一次。
                     // 否则大文件在第一个分片完成前一直显示 0 B / 速度 -。
                     let d = progressDelta.delta(cumulative)
                     if d > 0 { reporter.bump(d) }
                 }
+                registry.perform { states in states[index]?.preempt = false }
                 // 写盘失败（磁盘满 / 句柄已关闭 / seek 失败）绝不能算成功分片，
                 // 否则会产出「进度 100%」的空洞文件。
                 if let error = writeError.take() { throw error }
@@ -914,8 +1041,16 @@ final class DownloadEngine {
                 if attempt > tuning.maxRetries { throw e }
                 try? await Task.sleep(nanoseconds: UInt64(attempt) * 600_000_000)
             } catch is CancellationError {
+                if consumePreempt(registry: registry, index: index, box: box, manifestURL: manifestURL, isCancelled: isCancelled) {
+                    attempt = 0
+                    continue
+                }
                 throw YXError.cancelled
             } catch {
+                if consumePreempt(registry: registry, index: index, box: box, manifestURL: manifestURL, isCancelled: isCancelled) {
+                    attempt = 0
+                    continue
+                }
                 attempt += 1
                 if attempt > tuning.maxRetries { throw error }
                 let backoff = UInt64(min(500 * attempt, 3000)) * 1_000_000
