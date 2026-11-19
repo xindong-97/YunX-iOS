@@ -18,22 +18,33 @@ struct LoginView: View {
     @State private var hint: String = "请在页面内完成登录"
     @State private var manualCookie: String = ""
     @State private var showManual = false
+    @State private var xunleiWebView: WKWebView?
+    @State private var xunleiSaving = false
 
     var body: some View {
         NavigationStack {
             ZStack(alignment: .top) {
-                CookieWebView(urlString: loginURL,
-                              // 只去前导点。此前 replacingOccurrences(of: ".", with: "")
-                              // 会把 .quark.cn 变成 quarkcn，域匹配永久失效。
-                              cookieDomains: [platform.cookieDomain.hasPrefix(".")
-                                              ? String(platform.cookieDomain.dropFirst())
-                                              : platform.cookieDomain],
-                              requiredKeys: requiredKeys,
-                              onProgress: { progress = $0 },
-                              onFound: { cookie in
-                                  handleCaptured(cookie)
-                              })
-                    .ignoresSafeArea(edges: .bottom)
+                if platform == .xunlei {
+                    XunleiLoginWebView(webView: $xunleiWebView,
+                                       onProgress: { progress = $0 },
+                                       onTokens: { raw in
+                                           handleXunleiTokens(raw)
+                                       })
+                        .ignoresSafeArea(edges: .bottom)
+                } else {
+                    CookieWebView(urlString: loginURL,
+                                  // 只去前导点。此前 replacingOccurrences(of: ".", with: "")
+                                  // 会把 .quark.cn 变成 quarkcn，域匹配永久失效。
+                                  cookieDomains: [platform.cookieDomain.hasPrefix(".")
+                                                  ? String(platform.cookieDomain.dropFirst())
+                                                  : platform.cookieDomain],
+                                  requiredKeys: requiredKeys,
+                                  onProgress: { progress = $0 },
+                                  onFound: { cookie in
+                                      handleCaptured(cookie)
+                                  })
+                        .ignoresSafeArea(edges: .bottom)
+                }
 
                 if progress < 1 {
                     ProgressView(value: progress)
@@ -46,6 +57,12 @@ struct LoginView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if platform == .xunlei {
+                        Button("保存") { saveXunleiNow() }
+                            .disabled(xunleiSaving)
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("手动") { showManual = true }
@@ -64,9 +81,11 @@ struct LoginView: View {
                 .background(.ultraThinMaterial)
             }
             .onAppear {
-                // 无明确必需键的平台 WKWebView 不会自动回调 onFound，
-                // 直接引导手动粘贴，别让用户一直等「请在页面内完成登录」。
-                if requiredKeys.isEmpty {
+                if platform == .xunlei {
+                    hint = "请在页面内完成登录（扫码、密码、短信都行），成功后自动保存"
+                } else if requiredKeys.isEmpty {
+                    // 无明确必需键的平台 WKWebView 不会自动回调 onFound，
+                    // 直接引导手动粘贴，别让用户一直等「请在页面内完成登录」。
                     hint = "该平台无法自动检测登录态，请点右上角「手动」粘贴 Cookie / Token"
                 }
             }
@@ -107,6 +126,37 @@ struct LoginView: View {
         }
     }
 
+    private func handleXunleiTokens(_ raw: String) {
+        guard !xunleiSaving else { return }
+        xunleiSaving = true
+        hint = "已读到登录态，正在向服务端确认…"
+        Task {
+            let nick = await XunleiProvider().verifyAndSaveWebTokens(raw)
+            await MainActor.run {
+                xunleiSaving = false
+                if let nick {
+                    hint = "登录成功：\(nick)"
+                    onSuccess(XunleiAccount.accessToken())
+                    dismiss()
+                } else {
+                    hint = "读到了凭据但服务端未确认，请确认页面已显示登录成功"
+                }
+            }
+        }
+    }
+
+    private func saveXunleiNow() {
+        guard let webView = xunleiWebView, !xunleiSaving else { return }
+        webView.evaluateJavaScript(XunleiWebCredential.readScript) { result, _ in
+            guard let raw = result as? String, !raw.isEmpty,
+                  let decoded = raw.removingPercentEncoding, !decoded.isEmpty else {
+                Task { await MainActor.run { hint = "页面上还没有登录态，请先完成登录" } }
+                return
+            }
+            handleXunleiTokens(decoded)
+        }
+    }
+
     private var requiredKeys: [String] {
         switch platform {
         case .quark, .uc:  return ["__pus", "__puus"]
@@ -136,16 +186,31 @@ struct LoginView: View {
     private var manualSheet: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 14) {
-                Text("从任何能登录的浏览器复制完整 Cookie 串粘贴进来")
+                Text(platform == .xunlei
+                     ? "粘贴网页 localStorage 里的凭据 JSON，或直接粘贴 access_token"
+                     : "从任何能登录的浏览器复制完整 Cookie 串粘贴进来")
                     .font(.yxCaption)
                     .foregroundStyle(YXColor.secondaryLabel)
-                YXTextField(placeholder: "k1=v1; k2=v2; …",
+                YXTextField(placeholder: platform == .xunlei ? "{\"access_token\":\"…\"}" : "k1=v1; k2=v2; …",
                             text: $manualCookie,
                             symbol: "key",
                             axis: .vertical,
                             lineLimit: 4...10)
                 YXPrimaryButton(title: "保存并校验", symbol: "checkmark.seal") {
                     Task {
+                        if platform == .xunlei {
+                            if let nick = await XunleiProvider().verifyAndSaveWebTokens(manualCookie) {
+                                await MainActor.run {
+                                    hint = "已登录：\(nick)"
+                                    showManual = false
+                                    onSuccess(XunleiAccount.accessToken())
+                                    dismiss()
+                                }
+                            } else {
+                                await MainActor.run { hint = "Cookie 无效或已过期" }
+                            }
+                            return
+                        }
                         if let nick = await ResolveService.nickname(platform: platform, cookie: manualCookie) {
                             CookieStore.shared.setCookie(manualCookie, for: platform)
                             await MainActor.run {
@@ -278,6 +343,111 @@ struct CookieWebView: UIViewRepresentable {
                      didFailProvisionalNavigation navigation: WKNavigation!,
                      withError error: Error) {
             parent.onProgress(1)
+        }
+    }
+}
+
+struct XunleiLoginWebView: UIViewRepresentable {
+    @Binding var webView: WKWebView?
+    var onProgress: (Double) -> Void
+    var onTokens: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        let view = WKWebView(frame: .zero, configuration: config)
+        view.navigationDelegate = context.coordinator
+        view.allowsBackForwardNavigationGestures = true
+        view.customUserAgent = YXUA.chromeDesktop
+
+        context.coordinator.startPolling(view)
+
+        if let url = URL(string: XunleiWebCredential.loginURL) {
+            view.load(URLRequest(url: url))
+        }
+        DispatchQueue.main.async { self.webView = view }
+        return view
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        context.coordinator.parent = self
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var parent: XunleiLoginWebView
+        private weak var view: WKWebView?
+        private var timer: Timer?
+        private var hasFired = false
+
+        init(_ parent: XunleiLoginWebView) {
+            self.parent = parent
+        }
+
+        func startPolling(_ view: WKWebView) {
+            self.view = view
+            timer?.invalidate()
+            timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+                self?.checkLogin()
+            }
+        }
+
+        deinit {
+            timer?.invalidate()
+        }
+
+        private func checkLogin() {
+            guard !hasFired, let view else { return }
+            view.evaluateJavaScript(XunleiWebCredential.readScript) { [weak self] result, _ in
+                guard let self, let raw = result as? String, !raw.isEmpty,
+                      let decoded = raw.removingPercentEncoding, !decoded.isEmpty,
+                      XunleiWebCredential.parse(decoded) != nil else { return }
+                self.hasFired = true
+                self.timer?.invalidate()
+                self.timer = nil
+                self.parent.onTokens(decoded)
+            }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            parent.onProgress(1)
+            webView.evaluateJavaScript(XunleiWebCredential.renderFixScript, completionHandler: nil)
+            checkLogin()
+        }
+
+        func webView(_ webView: WKWebView,
+                     didStartProvisionalNavigation navigation: WKNavigation!) {
+            parent.onProgress(0.3)
+        }
+
+        func webView(_ webView: WKWebView,
+                     didFailProvisionalNavigation navigation: WKNavigation!,
+                     withError error: Error) {
+            parent.onProgress(1)
+        }
+
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor navigationAction: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard let url = navigationAction.request.url else {
+                decisionHandler(.cancel)
+                return
+            }
+            if url.scheme == "about" {
+                decisionHandler(.allow)
+                return
+            }
+            guard url.scheme == "https",
+                  let host = url.host?.lowercased(),
+                  host == "xunlei.com" || host.hasSuffix(".xunlei.com"),
+                  (url.port ?? 443) == 443 else {
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
         }
     }
 }
