@@ -1,0 +1,1059 @@
+//
+//  DownloadEngine.swift
+//  YunX · Range 分片并发下载引擎
+//
+//  严格对齐桌面版 ChunkDownloader / HttpRangePolicy 的判定链：
+//  · 两段式探测：先 Range: bytes=0-0（必须 206 且 Content-Range 精确为 0-0/total），失败再不带 Range 看 Content-Length；
+//  · Content-Type 含 text/html 一律判失败（这是防盗链/过期广告页，写盘就是垃圾数据）；
+//  · 分片请求收到 200 → RANGE_IGNORED，绝不为单片下载整文件，整任务回退单流；
+//  · 目标文件先 truncate 到总长度，各分片 seek 写入 —— 无合并、不占双份磁盘；
+//  · 每个分片已完成字节写入 manifest，重启后按 start+done 续传。
+//
+
+import Foundation
+
+// MARK: - 规格
+
+struct DownloadSpec {
+    var url: String
+    var headers: [String: String]
+    var filename: String
+    /// 解析阶段已知大小（仅探测失败时兜底；探测值优先）
+    var expectedSize: Int64 = 0
+}
+
+struct RangeProbe {
+    var totalBytes: Int64
+    var supportsRange: Bool
+    var etag: String?
+    var lastModified: String?
+}
+
+// MARK: - 分片计划
+
+struct ChunkPlan: Codable, Equatable {
+    var start: Int64
+    var end: Int64        // inclusive
+    var done: Int64
+
+    var length: Int64 { end - start + 1 }
+    var isFinished: Bool { done >= length }
+}
+
+struct DownloadManifest: Codable {
+    var version: Int = 3
+    var url: String
+    var totalBytes: Int64
+    var filename: String
+    var headers: [String: String]
+    var chunks: [ChunkPlan]
+    var etag: String?
+    var lastModified: String?
+
+    var doneBytes: Int64 { chunks.reduce(0) { $0 + min($1.done, $1.length) } }
+}
+
+// MARK: - 分片状态箱
+
+/// 各分片并发更新同一份 manifest，用引用类型 + 锁承载，
+/// 避免 inout 在 TaskGroup 里跨并发域传递（Swift 不允许）。
+final class ManifestBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var manifest: DownloadManifest
+
+    init(_ manifest: DownloadManifest) {
+        self.manifest = manifest
+    }
+
+    func snapshot() -> DownloadManifest {
+        lock.lock(); defer { lock.unlock() }
+        return manifest
+    }
+
+    func chunk(at index: Int) -> ChunkPlan {
+        lock.lock(); defer { lock.unlock() }
+        guard index >= 0, index < manifest.chunks.count else {
+            return ChunkPlan(start: 0, end: -1, done: 0)
+        }
+        return manifest.chunks[index]
+    }
+
+    @discardableResult
+    func addDone(index: Int, bytes: Int64) -> DownloadManifest {
+        lock.lock(); defer { lock.unlock() }
+        guard index >= 0, index < manifest.chunks.count else { return manifest }
+        manifest.chunks[index].done += bytes
+        return manifest
+    }
+}
+
+// MARK: - 调优
+
+struct DownloadTuning {
+    /// 用户在设置里选的线程数
+    var threads: Int = 16
+    /// 全局限速（0 = 不限）
+    var speedLimit: Int64 = 0
+    /// 单片重试次数
+    var maxRetries: Int = 3
+
+    static let `default` = DownloadTuning()
+
+    /// 实际 worker 数：迅雷类 CDN 单文件并发 > 8 会被降级成 200 整文件
+    func workers(platform: SharePlatform?) -> Int {
+        let asked = max(1, min(threads, 64))
+        if platform == .xunlei { return min(asked, 8) }
+        return min(asked, 32)
+    }
+
+    /// 分片数（对齐桌面：按大小分档，再按线程数补盈余）
+    static func chunkCount(total: Int64, threads: Int) -> Int {
+        guard total > 0 else { return 1 }
+        let bySize: Int
+        switch total {
+        case ..<(5 << 20):      bySize = 1
+        case ..<(50 << 20):     bySize = 8
+        case ..<(500 << 20):    bySize = 32
+        default:                bySize = 64
+        }
+        let want = max(bySize, threads * 8)
+        let bySlot = Int(max(1, total / (256 * 1024)))
+        return max(1, min(want, bySlot, 512))
+    }
+
+    func plan(totalBytes: Int64) -> [ChunkPlan] {
+        guard totalBytes > 0 else { return [] }
+        let count = Self.chunkCount(total: totalBytes, threads: threads)
+        let chunkSize = (totalBytes + Int64(count) - 1) / Int64(count)
+        var chunks: [ChunkPlan] = []
+        var start: Int64 = 0
+        while start < totalBytes {
+            let end = min(start + chunkSize - 1, totalBytes - 1)
+            chunks.append(ChunkPlan(start: start, end: end, done: 0))
+            start = end + 1
+        }
+        return chunks
+    }
+}
+
+// MARK: - 限速（全局令牌桶）
+
+final class SpeedLimiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var limit: Int64
+    private var tokens: Double
+    private var lastRefill = Date()
+
+    init(limit: Int64) {
+        self.limit = limit
+        self.tokens = Double(max(0, limit))
+    }
+
+    func update(limit newLimit: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        limit = newLimit
+        tokens = Double(max(0, newLimit))
+        lastRefill = Date()
+    }
+
+    func delay(for bytes: Int64) -> TimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        guard limit > 0, bytes > 0 else { return 0 }
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastRefill)
+        if elapsed > 0 {
+            tokens = min(Double(limit), tokens + elapsed * Double(limit))
+            lastRefill = now
+        }
+        if Double(bytes) <= tokens {
+            tokens -= Double(bytes)
+            return 0
+        }
+        let deficit = Double(bytes) - tokens
+        tokens = 0
+        return deficit / Double(limit)
+    }
+
+    func consume(_ bytes: Int64) async {
+        let d = delay(for: bytes)
+        if d > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000))
+        }
+    }
+}
+
+// MARK: - 分片返回状态
+
+enum ChunkOutcome {
+    case ok
+    case rangeIgnored
+}
+
+enum RangePolicyError: LocalizedError {
+    case rangeIgnored
+    case htmlResponse
+    case contentRangeMismatch(String)
+    case etagMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .rangeIgnored:                 return "服务器忽略了 Range 请求"
+        case .htmlResponse:                 return "直链返回了网页（防盗链或已过期）"
+        case .contentRangeMismatch(let v):  return "Content-Range 不匹配：\(v)"
+        case .etagMismatch:                 return "文件已变化，断点续传失效"
+        }
+    }
+}
+
+// MARK: - 写盘串行化
+
+/// FileHandle 的 seek+write 不是线程安全的，所有写盘走这一个串行队列。
+final class ChunkWriter {
+    private let queue = DispatchQueue(label: "com.yunx.download.write")
+    private var handles: [String: FileHandle] = [:]
+    private let lock = NSLock()
+
+    func open(_ key: String, at url: URL, size: Int64) throws {
+        try queue.sync {
+            lock.lock()
+            let stale = handles.removeValue(forKey: key)
+            lock.unlock()
+            if let stale {
+                try? stale.synchronize()
+                try? stale.close()
+            }
+            let fm = FileManager.default
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !fm.fileExists(atPath: url.path) {
+                fm.createFile(atPath: url.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: url)
+            let current = (try? handle.seekToEnd()) ?? 0
+            if current != UInt64(size) {
+                try handle.truncate(atOffset: UInt64(size))
+            }
+            lock.lock(); handles[key] = handle; lock.unlock()
+        }
+    }
+
+    func write(_ key: String, offset: Int64, data: Data) throws {
+        try queue.sync {
+            lock.lock(); let handle = handles[key]; lock.unlock()
+            guard let handle else { throw YXError.business("写入句柄已关闭") }
+            try handle.seek(toOffset: UInt64(offset))
+            try handle.write(contentsOf: data)
+        }
+    }
+
+    func close(_ key: String) {
+        queue.sync {
+            lock.lock(); let handle = handles.removeValue(forKey: key); lock.unlock()
+            guard let handle else { return }
+            try? handle.synchronize()
+            try? handle.close()
+        }
+    }
+
+    func closeAll() {
+        queue.sync {
+            lock.lock()
+            let all = handles
+            handles.removeAll()
+            lock.unlock()
+            for (_, h) in all {
+                try? h.synchronize()
+                try? h.close()
+            }
+        }
+    }
+}
+
+// MARK: - 流式传输协调器
+
+final class StreamTransfer: NSObject, URLSessionDataDelegate {
+    struct Job {
+        let url: URLRequest
+        let sink: (Data) -> Void
+        var onProgress: (Int64) -> Void
+        var received: Int64 = 0
+    }
+
+    private let lock = NSLock()
+    private var jobs: [Int: Job] = [:]
+    private var continuations: [Int: CheckedContinuation<Int64, Error>] = [:]
+    private var failure: [Int: Error] = [:]
+    private var suspended: Set<Int> = []
+    private let limiter: SpeedLimiter?
+    /// 必须先 super.init() 才能把 self 作为 delegate 传进去，所以这里用隐式解包
+    private var session: URLSession!
+
+    init(limiter: SpeedLimiter? = nil) {
+        self.limiter = limiter
+        super.init()
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 60
+        cfg.timeoutIntervalForResource = 7200
+        // 默认 6 会把手里的并发全压死
+        cfg.httpMaximumConnectionsPerHost = 64
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieAcceptPolicy = .never
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 8
+        queue.qualityOfService = .userInitiated
+        session = URLSession(configuration: cfg, delegate: self, delegateQueue: queue)
+    }
+
+    /// 发起一次传输，返回写入的字节数
+    func transfer(_ request: URLRequest,
+                  sink: @escaping (Data) -> Void,
+                  onProgress: @escaping (Int64) -> Void) async throws -> Int64 {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int64, Error>) in
+            let task = session.dataTask(with: request)
+            let job = Job(url: request, sink: sink, onProgress: onProgress)
+            lock.lock()
+            jobs[task.taskIdentifier] = job
+            continuations[task.taskIdentifier] = cont
+            lock.unlock()
+            task.resume()
+        }
+    }
+
+    func cancelAll() {
+        session.getAllTasks { tasks in
+            tasks.forEach { $0.cancel() }
+        }
+    }
+
+    // MARK: URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession,
+                    dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            return
+        }
+
+        lock.lock()
+        let job = jobs[dataTask.taskIdentifier]
+        lock.unlock()
+        guard job != nil else {
+            completionHandler(.cancel)
+            return
+        }
+
+        let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+        if contentType.contains("text/html") {
+            fail(taskId: dataTask.taskIdentifier, error: RangePolicyError.htmlResponse)
+            completionHandler(.cancel)
+            return
+        }
+
+        if let range = job?.url.value(forHTTPHeaderField: "Range") {
+            // 期望分片
+            if http.statusCode == 200 {
+                fail(taskId: dataTask.taskIdentifier, error: RangePolicyError.rangeIgnored)
+                completionHandler(.cancel)
+                return
+            }
+            if http.statusCode == 412 {
+                fail(taskId: dataTask.taskIdentifier, error: RangePolicyError.etagMismatch)
+                completionHandler(.cancel)
+                return
+            }
+            guard http.statusCode == 206 else {
+                fail(taskId: dataTask.taskIdentifier,
+                     error: YXError.badStatus(http.statusCode, "分片请求失败（HTTP \(http.statusCode)）"))
+                completionHandler(.cancel)
+                return
+            }
+            guard Self.contentRangeMatches(http.value(forHTTPHeaderField: "Content-Range"), requested: range) else {
+                fail(taskId: dataTask.taskIdentifier,
+                     error: RangePolicyError.contentRangeMismatch(http.value(forHTTPHeaderField: "Content-Range") ?? "nil"))
+                completionHandler(.cancel)
+                return
+            }
+        } else {
+            guard http.statusCode == 200 || http.statusCode == 206 else {
+                fail(taskId: dataTask.taskIdentifier,
+                     error: YXError.badStatus(http.statusCode, "下载失败（HTTP \(http.statusCode)）"))
+                completionHandler(.cancel)
+                return
+            }
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        guard var job = jobs[dataTask.taskIdentifier] else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        job.received += Int64(data.count)
+        job.sink(data)
+        job.onProgress(job.received)
+
+        lock.lock()
+        jobs[dataTask.taskIdentifier] = job
+        lock.unlock()
+
+        let delay = limiter?.delay(for: Int64(data.count)) ?? 0
+        if delay > 0 {
+            lock.lock()
+            let alreadySuspended = suspended.contains(dataTask.taskIdentifier)
+            if !alreadySuspended {
+                suspended.insert(dataTask.taskIdentifier)
+            }
+            lock.unlock()
+            guard !alreadySuspended else { return }
+            dataTask.suspend()
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                self.suspended.remove(dataTask.taskIdentifier)
+                self.lock.unlock()
+                dataTask.resume()
+            }
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let taskId = task.taskIdentifier
+        // didReceive response 里的策略性失败（Range 被忽略 / 防盗链 HTML /
+        // 状态码异常 / Content-Range 不匹配）都以 completionHandler(.cancel) 收尾，
+        // URLSession 此时只会回调 URLError.cancelled。必须先把真实错误取出来，
+        // 否则一切失败都会伪装成「用户取消」，200 回退与重试策略全部失效。
+        if let stored = takeFailure(taskId: taskId) {
+            finish(taskId: taskId, result: .failure(stored))
+            return
+        }
+        if let error {
+            if (error as? URLError)?.code == .cancelled {
+                finish(taskId: taskId, result: .failure(YXError.cancelled))
+            } else {
+                finish(taskId: taskId, result: .failure(YXError.network(error.localizedDescription)))
+            }
+            return
+        }
+        lock.lock()
+        let received = jobs[taskId]?.received ?? 0
+        lock.unlock()
+        finish(taskId: taskId, result: .success(received))
+    }
+
+    // MARK: 内部
+
+    private func fail(taskId: Int, error: Error) {
+        lock.lock()
+        failure[taskId] = error
+        lock.unlock()
+    }
+
+    private func takeFailure(taskId: Int) -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure.removeValue(forKey: taskId)
+    }
+
+    private func finish(taskId: Int, result: Result<Int64, Error>) {
+        lock.lock()
+        let cont = continuations.removeValue(forKey: taskId)
+        jobs.removeValue(forKey: taskId)
+        failure.removeValue(forKey: taskId)
+        suspended.remove(taskId)
+        lock.unlock()
+        guard let cont else { return }
+        switch result {
+        case .success(let n): cont.resume(returning: n)
+        case .failure(let e): cont.resume(throwing: e)
+        }
+    }
+
+    /// Content-Range: bytes 0-1048575/12345678，要求 start/end 与请求精确一致
+    static func contentRangeMatches(_ value: String?, requested: String) -> Bool {
+        guard let value else { return false }
+        guard let range = parseContentRange(value) else { return false }
+        // requested: bytes=<from>-<to>
+        let parts = requested.replacingOccurrences(of: "bytes=", with: "").split(separator: "-")
+        guard parts.count == 2,
+              let from = Int64(parts[0]),
+              let to = Int64(parts[1]) else { return false }
+        return range.start == from && range.end == to
+    }
+
+    static func parseContentRange(_ value: String) -> (start: Int64, end: Int64, total: Int64?)? {
+        // bytes 0-1048575/12345678
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard let spaceIdx = trimmed.firstIndex(of: " ") else { return nil }
+        let unit = trimmed[trimmed.startIndex..<spaceIdx].lowercased()
+        guard unit == "bytes" else { return nil }
+        let rest = trimmed[trimmed.index(after: spaceIdx)...]
+        let segs = rest.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let rangePart = segs.first else { return nil }
+        let bounds = rangePart.split(separator: "-")
+        guard bounds.count == 2,
+              let start = Int64(bounds[0]),
+              let end = Int64(bounds[1]) else { return nil }
+        var total: Int64? = nil
+        if segs.count == 2 {
+            let t = segs[1].trimmingCharacters(in: .whitespaces)
+            if t != "*" { total = Int64(t) }
+        }
+        return (start, end, total)
+    }
+}
+
+// MARK: - 探测：只读响应头，绝不缓冲 body
+
+/// 早期 probe 用 `URLSession.data(for:)`：服务器忽略 Range 时会把整个 GB 级
+/// 文件读进内存，第二段不带 Range 的 GET 还会再全量下一遍。UI 因此长时间
+/// 停在「下载中 · 0 B · 速度 -」，甚至直接被系统 OOM kill。
+/// 这里在收到响应头的瞬间 cancel task，只把 headers 交回调用方。
+private final class HeaderProbe: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiting: [Int: CheckedContinuation<HTTPURLResponse, Error>] = [:]
+
+    func headers(for request: URLRequest, on session: URLSession) async throws -> HTTPURLResponse {
+        let task = session.dataTask(with: request)
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HTTPURLResponse, Error>) in
+            lock.lock()
+            waiting[task.taskIdentifier] = cont
+            lock.unlock()
+            task.resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession,
+                    dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        completionHandler(.cancel)          // body 一个字节都不收
+        lock.lock()
+        let cont = waiting.removeValue(forKey: dataTask.taskIdentifier)
+        lock.unlock()
+        guard let http = response as? HTTPURLResponse else {
+            cont?.resume(throwing: YXError.network("探测未收到 HTTP 响应"))
+            return
+        }
+        cont?.resume(returning: http)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let cont = waiting.removeValue(forKey: task.taskIdentifier)
+        lock.unlock()
+        guard let cont else { return }
+        if let error, (error as? URLError)?.code != .cancelled {
+            cont.resume(throwing: error)
+        } else {
+            cont.resume(throwing: YXError.network("探测在返回响应头之前结束"))
+        }
+    }
+}
+
+/// URLSession 的 onProgress 给的是累计字节，ProgressReporter 需要增量。
+private final class ProgressDelta: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: Int64 = 0
+
+    func delta(_ cumulative: Int64) -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        let d = cumulative - last
+        if cumulative > last { last = cumulative }
+        return d > 0 ? d : 0
+    }
+}
+
+// MARK: - 引擎
+
+final class DownloadEngine {
+
+    private let tuning: DownloadTuning
+    private let limiter: SpeedLimiter
+    private let writer = ChunkWriter()
+    private let probeFetcher: HeaderProbe
+    private let probeSession: URLSession
+    private let transfersLock = NSLock()
+    private var activeTransfers: [String: [StreamTransfer]] = [:]
+
+    func registerTransfer(_ transfer: StreamTransfer, for sessionKey: String) {
+        transfersLock.lock()
+        defer { transfersLock.unlock() }
+        activeTransfers[sessionKey, default: []].append(transfer)
+    }
+
+    func unregisterTransfer(_ transfer: StreamTransfer, for sessionKey: String) {
+        transfersLock.lock()
+        defer { transfersLock.unlock() }
+        guard var list = activeTransfers[sessionKey] else { return }
+        list.removeAll { $0 === transfer }
+        if list.isEmpty {
+            activeTransfers.removeValue(forKey: sessionKey)
+        } else {
+            activeTransfers[sessionKey] = list
+        }
+    }
+
+    func cancelTransfers(for sessionKey: String) {
+        transfersLock.lock()
+        let list = activeTransfers[sessionKey] ?? []
+        transfersLock.unlock()
+        list.forEach { $0.cancelAll() }
+    }
+
+    init(tuning: DownloadTuning = .default) {
+        self.tuning = tuning
+        self.limiter = SpeedLimiter(limit: tuning.speedLimit)
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 25
+        cfg.httpMaximumConnectionsPerHost = 8
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieAcceptPolicy = .never
+        let fetcher = HeaderProbe()
+        probeFetcher = fetcher
+        probeSession = URLSession(configuration: cfg, delegate: fetcher, delegateQueue: nil)
+    }
+
+    func setSpeedLimit(_ bytesPerSecond: Int64) async {
+        await limiter.update(limit: bytesPerSecond)
+    }
+
+    // MARK: 两段式探测
+
+    func probe(_ spec: DownloadSpec) async throws -> RangeProbe {
+        guard let url = URL(string: spec.url) else { throw YXError.invalidURL(spec.url) }
+
+        // 第 1 段：Range: bytes=0-0
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 25
+        req.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        for (k, v) in spec.headers {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+        if let http = try? await probeFetcher.headers(for: req, on: probeSession) {
+            let ct = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            if !ct.contains("text/html"),
+               http.statusCode == 206,
+               let cr = http.value(forHTTPHeaderField: "Content-Range"),
+               let parsed = StreamTransfer.parseContentRange(cr),
+               parsed.start == 0, parsed.end == 0,
+               let total = parsed.total, total > 0 {
+                return RangeProbe(totalBytes: total, supportsRange: true,
+                                  etag: http.value(forHTTPHeaderField: "ETag"),
+                                  lastModified: http.value(forHTTPHeaderField: "Last-Modified"))
+            }
+            if http.statusCode == 403 || http.statusCode == 412 || http.statusCode == 401 {
+                throw YXError.business("直链已过期或无权访问（HTTP \(http.statusCode)），请重新解析")
+            }
+        }
+
+        // 第 2 段：不带 Range
+        var plain = URLRequest(url: url)
+        plain.httpMethod = "GET"
+        plain.timeoutInterval = 25
+        for (k, v) in spec.headers {
+            plain.setValue(v, forHTTPHeaderField: k)
+        }
+        // 同样只读响应头：Content-Length 已经足够，不需要把整个文件拉回来
+        let http = try await probeFetcher.headers(for: plain, on: probeSession)
+        let ct = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+        if ct.contains("text/html") {
+            throw RangePolicyError.htmlResponse
+        }
+        if http.statusCode == 403 || http.statusCode == 412 || http.statusCode == 401 {
+            throw YXError.business("直链已过期或无权访问（HTTP \(http.statusCode)），请重新解析")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw YXError.badStatus(http.statusCode, "探测失败（HTTP \(http.statusCode)）")
+        }
+        let len = http.value(forHTTPHeaderField: "Content-Length").flatMap { Int64($0) } ?? 0
+        let total = spec.expectedSize > 0 ? spec.expectedSize : len
+        return RangeProbe(totalBytes: total, supportsRange: false,
+                          etag: http.value(forHTTPHeaderField: "ETag"),
+                          lastModified: http.value(forHTTPHeaderField: "Last-Modified"))
+    }
+
+    static func manifestMatches(_ old: DownloadManifest, probe: RangeProbe, spec: DownloadSpec) -> Bool {
+        guard old.url == spec.url,
+              old.totalBytes == probe.totalBytes,
+              !old.chunks.isEmpty,
+              old.filename == spec.filename else { return false }
+        if let oldEtag = old.etag, let newEtag = probe.etag, oldEtag != newEtag { return false }
+        if let oldMod = old.lastModified, let newMod = probe.lastModified, oldMod != newMod { return false }
+        return true
+    }
+
+    // MARK: 主流程
+
+    func download(spec: DownloadSpec,
+                  destination: URL,
+                  manifestURL: URL,
+                  existingManifest: DownloadManifest?,
+                  platform: SharePlatform? = nil,
+                  sessionKey: String = "",
+                  progress: @escaping @Sendable (Int64, Int64) -> Void,
+                  isCancelled: @escaping @Sendable () -> Bool) async throws -> DownloadManifest {
+
+        let probe = try await self.probe(spec)
+
+        // 不支持 Range → 单流
+        guard probe.supportsRange, probe.totalBytes > 0 else {
+            return try await singleStream(spec: spec,
+                                          destination: destination,
+                                          manifestURL: manifestURL,
+                                          total: probe.totalBytes,
+                                          etag: probe.etag,
+                                          lastModified: probe.lastModified,
+                                          sessionKey: sessionKey,
+                                          progress: progress,
+                                          isCancelled: isCancelled)
+        }
+
+        var manifest: DownloadManifest
+        if let old = existingManifest, Self.manifestMatches(old, probe: probe, spec: spec) {
+            manifest = old
+            manifest.url = spec.url
+            manifest.headers = spec.headers
+            manifest.etag = probe.etag
+            manifest.lastModified = probe.lastModified
+        } else {
+            manifest = DownloadManifest(url: spec.url,
+                                        totalBytes: probe.totalBytes,
+                                        filename: spec.filename,
+                                        headers: spec.headers,
+                                        chunks: tuning.plan(totalBytes: probe.totalBytes),
+                                        etag: probe.etag,
+                                        lastModified: probe.lastModified)
+        }
+
+        let total = manifest.totalBytes
+        let writerKey = sessionKey.isEmpty ? destination.path : sessionKey
+        try writer.open(writerKey, at: destination, size: total)
+        try persist(manifest, to: manifestURL)
+
+        let box = ManifestBox(manifest)
+        let workers = tuning.workers(platform: platform)
+        let reporter = ProgressReporter(initial: manifest.doneBytes, total: total, onUpdate: progress)
+        progress(manifest.doneBytes, total)
+
+        // 分片索引队列（按字节顺序发，物理相邻利于连接复用）
+        var pending = manifest.chunks.indices.filter { !manifest.chunks[$0].isFinished }
+
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var running = 0
+                var launchIndex = 0
+
+                func launch(_ index: Int) {
+                    let staggerSeed = launchIndex
+                    group.addTask { [self] in
+                        // 错峰建连，避免 TCP/TLS 突发
+                        let stagger = UInt64(min(staggerSeed, 8)) * 25_000_000
+                        if stagger > 0 { try? await Task.sleep(nanoseconds: stagger) }
+                        try await runChunk(index: index,
+                                           spec: spec,
+                                           box: box,
+                                           manifestURL: manifestURL,
+                                           writerKey: writerKey,
+                                           sessionKey: sessionKey,
+                                           etag: probe.etag,
+                                           reporter: reporter,
+                                           isCancelled: isCancelled)
+                    }
+                }
+
+                while running < min(workers, max(1, pending.count)), !pending.isEmpty {
+                    let next = pending.removeFirst()
+                    launch(next)
+                    launchIndex += 1
+                    running += 1
+                }
+
+                while try await group.next() != nil {
+                    running -= 1
+                    if !pending.isEmpty {
+                        let next = pending.removeFirst()
+                        launch(next)
+                        launchIndex += 1
+                        running += 1
+                    }
+                }
+            }
+        } catch let policy as RangePolicyError {
+            writer.close(writerKey)
+            if case .rangeIgnored = policy {
+                try? FileManager.default.removeItem(at: manifestURL)
+                return try await singleStream(spec: spec,
+                                              destination: destination,
+                                              manifestURL: manifestURL,
+                                              total: probe.totalBytes,
+                                              etag: probe.etag,
+                                              lastModified: probe.lastModified,
+                                              sessionKey: sessionKey,
+                                              progress: progress,
+                                              isCancelled: isCancelled)
+            }
+            if case .etagMismatch = policy {
+                try? FileManager.default.removeItem(at: manifestURL)
+                return try await singleStream(spec: spec,
+                                              destination: destination,
+                                              manifestURL: manifestURL,
+                                              total: probe.totalBytes,
+                                              etag: probe.etag,
+                                              lastModified: probe.lastModified,
+                                              sessionKey: sessionKey,
+                                              progress: progress,
+                                              isCancelled: isCancelled)
+            }
+            if !isCancelled() {
+                try? persist(box.snapshot(), to: manifestURL)
+            }
+            throw policy
+        } catch {
+            writer.close(writerKey)
+            if !isCancelled() {
+                try? persist(box.snapshot(), to: manifestURL)
+            }
+            throw error
+        }
+
+        writer.close(writerKey)
+        let finalManifest = box.snapshot()
+        try persist(finalManifest, to: manifestURL)
+        progress(total, total)
+        return finalManifest
+    }
+
+    // MARK: 单片
+
+    private func runChunk(index: Int,
+                          spec: DownloadSpec,
+                          box: ManifestBox,
+                          manifestURL: URL,
+                          writerKey: String,
+                          sessionKey: String,
+                          etag: String?,
+                          reporter: ProgressReporter,
+                          isCancelled: @escaping @Sendable () -> Bool) async throws {
+        var attempt = 0
+        while true {
+            if isCancelled() { throw YXError.cancelled }
+            try Task.checkCancellation()
+            let plan = box.chunk(at: index)
+            if plan.isFinished { return }
+
+            let from = plan.start + plan.done
+            let to = plan.end
+            if from > to { return }
+
+            do {
+                guard let url = URL(string: spec.url) else { throw YXError.invalidURL(spec.url) }
+                var req = URLRequest(url: url)
+                req.httpMethod = "GET"
+                req.timeoutInterval = 60
+                req.setValue("bytes=\(from)-\(to)", forHTTPHeaderField: "Range")
+                if let etag {
+                    req.setValue(etag, forHTTPHeaderField: "If-Range")
+                }
+                for (k, v) in spec.headers {
+                    req.setValue(v, forHTTPHeaderField: k)
+                }
+
+                var offset = from
+                let transfer = StreamTransfer(limiter: limiter)
+                registerTransfer(transfer, for: sessionKey)
+                defer { unregisterTransfer(transfer, for: sessionKey) }
+                let writeError = WriteErrorBox()
+                let progressDelta = ProgressDelta()
+                let received = try await transfer.transfer(req) { data in
+                    if writeError.take() == nil {
+                        do {
+                            try self.writer.write(writerKey, offset: offset, data: data)
+                        } catch {
+                            writeError.record(error)
+                        }
+                    }
+                    offset += Int64(data.count)
+                } onProgress: { cumulative in
+                    // 每收到一段就上报，而不是等整片（约 13MB）跑完才动一次。
+                    // 否则大文件在第一个分片完成前一直显示 0 B / 速度 -。
+                    let d = progressDelta.delta(cumulative)
+                    if d > 0 { reporter.bump(d) }
+                }
+                // 写盘失败（磁盘满 / 句柄已关闭 / seek 失败）绝不能算成功分片，
+                // 否则会产出「进度 100%」的空洞文件。
+                if let error = writeError.take() { throw error }
+                if isCancelled() { throw YXError.cancelled }
+                try Task.checkCancellation()
+
+                let snapshot = box.addDone(index: index, bytes: received)
+                reporter.flush()          // 补上被 0.2s 节流吃掉的最后一段
+                try? persist(snapshot, to: manifestURL)
+
+                if box.chunk(at: index).isFinished { return }
+                // 未满则继续拉剩余部分
+                attempt = 0
+                if received == 0 { throw YXError.network("分片返回 0 字节") }
+            } catch let e as RangePolicyError {
+                if case .rangeIgnored = e {
+                    throw e
+                }
+                if case .etagMismatch = e {
+                    throw e
+                }
+                attempt += 1
+                if attempt > tuning.maxRetries { throw e }
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 600_000_000)
+            } catch is CancellationError {
+                throw YXError.cancelled
+            } catch {
+                attempt += 1
+                if attempt > tuning.maxRetries { throw error }
+                let backoff = UInt64(min(500 * attempt, 3000)) * 1_000_000
+                try? await Task.sleep(nanoseconds: backoff)
+            }
+        }
+    }
+
+    // MARK: 单流
+
+    private func singleStream(spec: DownloadSpec,
+                              destination: URL,
+                              manifestURL: URL,
+                              total: Int64,
+                              etag: String? = nil,
+                              lastModified: String? = nil,
+                              sessionKey: String = "",
+                              progress: @escaping @Sendable (Int64, Int64) -> Void,
+                              isCancelled: @escaping @Sendable () -> Bool) async throws -> DownloadManifest {
+        guard let url = URL(string: spec.url) else { throw YXError.invalidURL(spec.url) }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 60
+        for (k, v) in spec.headers {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+
+        let reporter = ProgressReporter(initial: 0, total: total, onUpdate: progress)
+        var offset: Int64 = 0
+        let writerKey = sessionKey.isEmpty ? destination.path : sessionKey
+        try writer.open(writerKey, at: destination, size: 0)
+        let transfer = StreamTransfer(limiter: limiter)
+        registerTransfer(transfer, for: writerKey)
+        defer { unregisterTransfer(transfer, for: writerKey) }
+
+        let writeError = WriteErrorBox()
+        let written: Int64
+        do {
+            written = try await transfer.transfer(req) { data in
+                if writeError.take() == nil {
+                    do {
+                        try self.writer.write(writerKey, offset: offset, data: data)
+                    } catch {
+                        writeError.record(error)
+                    }
+                }
+                offset += Int64(data.count)
+                reporter.bump(Int64(data.count))
+            } onProgress: { _ in }
+        } catch {
+            writer.close(writerKey)
+            throw error
+        }
+        if let error = writeError.take() {
+            writer.close(writerKey)
+            throw error
+        }
+        if isCancelled() {
+            writer.close(writerKey)
+            throw YXError.cancelled
+        }
+        try Task.checkCancellation()
+
+        writer.close(writerKey)
+
+        let manifest = DownloadManifest(url: spec.url,
+                                        totalBytes: written,
+                                        filename: spec.filename,
+                                        headers: spec.headers,
+                                        chunks: [ChunkPlan(start: 0, end: max(0, written - 1), done: written)],
+                                        etag: etag,
+                                        lastModified: lastModified)
+        try persist(manifest, to: manifestURL)
+        progress(written, written)
+        return manifest
+    }
+
+    // MARK: 工具
+
+    private func persist(_ manifest: DownloadManifest, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(manifest)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+/// delegate 的 sink 闭包不能 throw，写盘失败先记在这里，
+/// transfer 结束后由调用方统一抛出，避免「写失败但仍标记分片完成」。
+private final class WriteErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Error?
+
+    func record(_ error: Error) {
+        lock.lock(); defer { lock.unlock() }
+        if value == nil { value = error }
+    }
+
+    func take() -> Error? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
+// MARK: - 进度节流
+
+final class ProgressReporter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var downloaded: Int64
+    private let total: Int64
+    private var lastEmit = Date.distantPast
+    private let onUpdate: @Sendable (Int64, Int64) -> Void
+
+    init(initial: Int64, total: Int64, onUpdate: @escaping @Sendable (Int64, Int64) -> Void) {
+        self.downloaded = initial
+        self.total = total
+        self.onUpdate = onUpdate
+    }
+
+    func bump(_ bytes: Int64) {
+        lock.lock()
+        if bytes > 0 { downloaded += bytes }
+        let now = Date()
+        let shouldEmit = now.timeIntervalSince(lastEmit) > 0.2
+        if shouldEmit { lastEmit = now }
+        let snapshot = downloaded
+        lock.unlock()
+        if shouldEmit { onUpdate(snapshot, total) }
+    }
+
+    /// 分片结束时强制补发一次，避免末尾不足 0.2s 的进度被节流丢弃
+    func flush() {
+        lock.lock()
+        let snapshot = downloaded
+        lastEmit = Date()
+        lock.unlock()
+        onUpdate(snapshot, total)
+    }
+}
