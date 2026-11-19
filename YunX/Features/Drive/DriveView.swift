@@ -150,6 +150,7 @@ struct DriveView: View {
                     YXBadge(text: "已登录", tint: YXColor.success)
                     Button {
                         CookieStore.shared.removeCookie(for: platform)
+                        if platform == .xunlei { XunleiAccount.clear() }
                         refresh()
                     } label: {
                         Image(systemName: "rectangle.portrait.and.arrow.right")
