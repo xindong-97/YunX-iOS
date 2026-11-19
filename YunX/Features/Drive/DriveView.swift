@@ -17,8 +17,8 @@ struct DriveView: View {
         var total: Int64 = 0
     }
 
-    private let loginPlatforms: [SharePlatform] = [.quark, .uc, .baidu, .pan115, .lanzou, .ilanzou]
-    private let guestPlatforms: [SharePlatform] = [.pan123, .c139, .guangya, .xunlei, .github]
+    private let loginPlatforms: [SharePlatform] = [.quark, .uc, .baidu, .pan115, .lanzou, .ilanzou, .xunlei]
+    private let guestPlatforms: [SharePlatform] = [.pan123, .c139, .guangya, .github]
 
     var body: some View {
         NavigationStack {
